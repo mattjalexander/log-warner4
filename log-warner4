@@ -1,0 +1,192 @@
+#!/usr/bin/perl -Ww
+#
+# log-warner4.pl
+#
+# JAN 2008: v2 additions:
+#    * improved efficiency by removing system calls (wc, etc.)
+#    * use strict & warnings pragmas
+#    * externalized rule sets
+# Future thoughts:
+#    * write in C for improved efficiency
+#
+# NOV 2008 additions:
+#    * Added debuging output if $DEBUG var is set to 1
+#    * added logic to properly parse multiline log files
+#
+# AUG 2009:
+#    * externalize critical rules
+#    * only print out the matching part of criticals
+#
+
+use Getopt::Long;
+use File::Basename;
+use Fcntl 'SEEK_CUR';
+use strict;
+use warnings 'all';
+
+use lib '/etc/zabbix/bin';
+use cos_evt;
+use cos_evt_nohup;
+
+# OUTPUT_AUTOFLUSH. 
+# If set to nonzero, forces an fflush(3) after every write or print on the 
+# currently selected output channel.
+$| = 1;
+
+# number of critical & warning level errors
+my $crit_count=0;
+my $warn_count=0;
+my $unknown_count=0;
+my @warns;
+my @errors;
+my @unknowns;
+
+my %ERRORS=('OK'=>0,'WARNING'=>1,'CRITICAL'=>2,'UNKNOWN'=>3,'DEPENDENT'=>4);
+
+# the file to read
+my $file='';
+my $ruleset='';
+
+#my $crit_ruleset='';
+#my $rules='';
+my $break='';
+
+my $time_stamp = `date`;
+chomp ($time_stamp);
+
+# Parse the user input.
+if ( GetOptions(
+                "file=s" => \$file,
+		"ruleset=s" => \$ruleset,
+#		"crit_ruleset=s" => \$crit_ruleset,
+                "break:s" => \$break
+               ) == 0
+   ) { 
+       die "getopt error ($file, $ruleset, $break)";
+     }
+
+if ( $file eq '' ) { die "You must choose a file"; }
+if ( $ruleset eq '' ) { die "You must choose a ruleset to define what to ignore"; }
+
+# If no line break sequence is specified, assume log4j log format
+if ( $break eq '' ) {
+  $break = '^\d\d:\d\d:\d\d,\d\d\d\s'; # single quotes to avoid interpretation
+}
+
+# derive the temporary file name
+my $base_name=basename($file);
+my $base_ruleset=basename($ruleset);
+
+my $DEBUG=0; # Debug flag, causes extra output to be written to /tmp
+
+open (DIAG, ">> /tmp/$base_name-$base_ruleset-diag.log") if $DEBUG;
+
+print (DIAG "--Starting execution $time_stamp--\n") if $DEBUG;
+
+print (DIAG "Line break string -->$break<--\n") if $DEBUG;
+
+# find out where in the log file to begin looking
+my $COUNT_FILE="/tmp/.critlog_watcher-$base_name-$base_ruleset-nagioscount";
+my $first_byte=0;
+if (-r $COUNT_FILE) {
+	open(CH, "< $COUNT_FILE");
+	$first_byte=<CH>;
+	close(CH);
+}
+
+# test to see if the recorded file size is bigger than the file.
+# This happens every night at rollover.
+my $filesize = -s $file;
+if ( $first_byte > $filesize ) {
+	$first_byte=0;
+}
+
+#first loop - read the file and fill the array with properly parsed entries
+
+my @log = ("START\n"); # initialize/declare the array
+
+open(INPUT, "< $file") || die("can't open $file: $!");
+sysseek(INPUT,$first_byte,0);
+while (<INPUT>) {
+    if (!/($break)/) {    # If line does not start with specified regex
+#    if (!/^\d\d:\d\d:\d\d,\d\d\d\s/) {    # if line does NOT start with a time-stamp
+	$log[-1] .= $_;                   # append that line to the previous array element
+    } else {
+	push @log, $_;                    # put it in the next array element
+    } 
+} #INPUT
+
+
+#second loop - parse the array
+my $crit_ruleset=$ruleset."_crit";
+my $warn_ruleset=$ruleset."_warn";
+my $unk_ruleset=$ruleset."_ignore";
+
+foreach (@log) {
+	my $matching = $_;
+	if ($matching = $ruleset->$crit_ruleset($_) ) {
+		$crit_count++;
+		chomp $matching;
+#                $matching =~ s/\n/#/g; # change all newlines to '#' - helps with nagios output to not have \n
+		push (@errors, "$matching##");
+   		print (DIAG "CRITICAL:\n-->\n$_<--\n") if $DEBUG;
+	}
+
+	elsif ($matching = $ruleset->$warn_ruleset($_) ) {
+                $warn_count++;
+		chomp $matching;
+#                $matching =~ s/\n/#/g; # change all newlines to '#' - helps with nagios output to not have \n
+                push (@warns, "$matching##");
+                print (DIAG "WARNING:\n-->\n$_<--\n") if $DEBUG;
+        }
+
+	# note that this are negative matches
+	elsif ( ! $ruleset->$unk_ruleset($_) ) {
+		  $unknown_count++;
+		  chomp;  # explicitly chomps the $_ variable
+#                  s/\n/#/g;  # change all newlines to '#' - helps with nagios output to not have \n
+                  push(@unknowns, "$_##");
+                  print (DIAG "UNKNOWN:\n-->\n$_<--\n") if $DEBUG;
+	}
+
+} # foreach
+
+print (DIAG "START STRING:\n-->\n$log[0]<--\n") if $DEBUG;
+
+
+my $last_byte=sysseek (INPUT, 0, SEEK_CUR);
+if ($last_byte == '0 but true')
+  { $last_byte=0; }
+
+close(INPUT);
+my $lines_read=$last_byte - $first_byte;
+
+my $retcode=$ERRORS{'UNKNOWN'};
+
+if ($crit_count > 0) {
+    #print "----$crit_count CRITICALS----\n@errors, $warn_count warn, $unknown_count unk:\n@errors@warns@unknowns\n";
+    print "\n----$crit_count CRITICALS----\n@errors\n\n----$warn_count warnings----\n@warns\n\n----$unknown_count unknowns----\n@unknowns\n";
+    $retcode=$ERRORS{'CRITICAL'};
+} elsif ($warn_count > 0) {
+    print "----$warn_count WARNINGS----\n@warns\n\n----$unknown_count unknowns----\n@unknowns\n";
+    $retcode=1;
+} elsif ($unknown_count > 0) {
+    print "----$unknown_count UNKNOWNS----\n @unknowns\n";
+    $retcode=3;
+} else {
+    print "OK No new errors between bytes $first_byte and $last_byte ($lines_read bytes)\n";
+    $retcode=$ERRORS{'OK'};
+}
+
+open(FH, "> $COUNT_FILE") || die("can't open $COUNT_FILE: $?");
+print FH "$last_byte";
+close(FH);
+
+$time_stamp = `date`;
+chomp ($time_stamp);
+
+print (DIAG "--Ending execution $time_stamp--\n") if $DEBUG;
+
+close (DIAG) if $DEBUG;
+
+exit $retcode;
